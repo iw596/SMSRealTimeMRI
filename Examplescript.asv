@@ -1,0 +1,175 @@
+%% Add recon toolbox and path to data
+addpath(genpath('./.'));
+
+%% Load data
+twix = mapVBVD('Data\meas_MID00187_FID26571_MultiSlice_RTMRI')
+params = ExtractParams(twix{2});
+imsize = [params.NCol,params.NCol,params.RefNSli];
+data = double(twix{2}.image.unsorted);
+data = permute(data, [ 1 3 2]);
+NSli = params.RefNSli;
+NPoints = params.NCol;
+
+%% Generate trajectory and phase cycling
+[k,angles] = GenerateRadialTrajectory(params);
+phi = ones(params.NCol,params.NLin*params.NRep,NSli);
+for sli = 1:NSli
+    phaseIncrement = 2 * pi * (sli-1)/NSli;
+    for ln = 0:params.NLin*params.NRep-1
+        phs = ln * phaseIncrement; % We are assuming that each line is acquired with a new RF pulse with separte phase increment
+        phs = mod(phs, 2 * pi);
+        phi(:,ln+1,sli) = exp(-1j * (phs));
+    end
+end
+
+%% For this script we remove first 20 repetitions for steady-state contrast
+NLinesIn20Steps = 20 * params.NLin;
+data = data(:,NLinesIn20Steps+1:end,:);
+k = k(:,NLinesIn20Steps+1:end);
+phi = phi(:,NLinesIn20Steps+1:end,:);
+params.NRep = params.NRep-20;
+
+%% Compress the k-space
+NVc = 16;
+cMat = PCACoilCompression(reshape(data,[params.NCol*params.NLin*params.NRep,params.NCha]),NVc);
+data = ApplyPCACompression(data,[params.NCol params.NLin*params.NRep],params.NCha,cMat);
+params.NCha = NVc;
+
+
+%% Estimate Coil sensitivity maps from center of k-space  using ESPIRIT
+centralKSpace = k(round(NPoints/3)+1:2*round(NPoints/3),:);
+centralPhaseCycling = phi(round(NPoints/3)+1:2*round(NPoints/3),:,:);
+centralData = data(round(NPoints/3)+1:2*round(NPoints/3),:,:);
+FT_center = GPUNUFFT(centralKSpace,imsize(1:2),size(centralData,[1,2]),1,2.0,4);
+
+%% Coil by coil estimate of the low res image using CG
+m = [];
+for sli =1:NSli
+    for c = 1:params.NCha
+        y = FT_center'*bsxfun(@times, hann(round(NPoints/3)),conj(centralPhaseCycling(:,:,sli)).*centralData(:,:,c));
+       x = 0*y(:);
+       r = y(:);
+       p = r;
+       rr = r'*r;
+        for i = 1:10
+            Ap = FT_center'*(conj(centralPhaseCycling(:,:,sli)).*(centralPhaseCycling(:,:,sli).*(FT_center*p)));
+            Ap = Ap(:);
+            a = rr/(p'*Ap);
+            x = x + a*p;
+            rnew = r - a*Ap;
+           b = (rnew'*rnew)/rr;
+           r = rnew;
+           rr = r'*r;
+           p = r + b*p;
+        
+       end
+        m(:,:,sli,c) = reshape(y,[imsize(1:2)]);
+    end
+end
+
+m = fft2c(m);
+m       =   m(NPoints/2-12+1:NPoints/2+12,NPoints/2-12+1:NPoints/2+12,:,:);
+sens = [];
+for sli =1:NSli
+    sens(:,:,sli,:) =  espirit(reshape(m(:,:,sli,:),24,24,1,params.NCha),[NPoints,NPoints],[5,5],0.02,0.5);
+end
+
+
+%% Crop SENSE maps to remove siemens read oversampling
+NCrop = 128;
+N  =   (params.NCol-NCrop)/2;
+sens  =   sens(N+1:N+NCrop,N+1:N+NCrop,:,:);
+imsize(1:2) = [NCrop,NCrop];
+
+
+%% Prepare the reconstruction and phase cycling operator
+NSpokes = 25;
+ppp = 1;
+NFrames = floor(size(data,2)./NSpokes(ppp));% Calculate how many full frames we can get
+trim = size(data,2) - (NFrames*NSpokes(ppp));% Calculate how much data we need to trim off the end
+kTrim = k(:,1:end-trim,:);
+k_t = reshape(kTrim,[params.NCol,NSpokes(ppp),NFrames]);
+datasize = [params.NCol NSpokes(ppp)];
+dcf = [];
+% Prepare NUFFTs and DCF
+clear('NUFFTOperators')
+for t = 1:NFrames
+    op = GPUNUFFT(k_t(:,:,t),imsize(1:2),[params.NCol NSpokes(ppp)],params.NCha,2.0,3);
+    NUFFTOperators(t) = op;
+end
+
+% Prepare phase cycling
+phi_t = phi(:,1:end-trim,:);
+phi_t = reshape(phi_t,[params.NCol,NSpokes(ppp),NFrames,NSli]);
+phi_t = permute(phi_t,[1 2 4 3]);
+datasize = [params.NCol NSpokes(ppp)];
+A = GASMSOperator(NUFFTOperators,[],squeeze(sens),phi_t,imsize,datasize,NFrames);
+
+
+%% Prepare data
+dataTrimmed = data(:,1:end-trim,:);
+dataTrimmed = reshape(dataTrimmed,[params.NCol,NSpokes(ppp),NFrames,params.NCha]);
+dataTrimmed = permute(dataTrimmed,[1 2 4 3]);
+
+%% Estimate scaling using PCG
+pcgFunc = @(x)(vec(A'*(A*x)));
+b = A'*dataTrimmed;
+cgres = pcg(pcgFunc,b(:),1e-4,2,[],[],0.*b(:));
+cgres = reshape(cgres,[imsize NFrames]);
+
+%% Data scaling, this lets lambda values be similar values between datasets
+bbb = abs(cgres(:));
+sortedData = sort(bbb,'ascend');
+p100 = sortedData(end);
+p90 = sortedData(round(.9 * length(sortedData)));
+p50 = sortedData(round(.5 * length(sortedData)));
+if (p100 - p90) < 2 * (p90 - p50)
+    scaling = p90;
+else
+    scaling = p100;
+end
+clear('bbb');
+fprintf('\nScaling: %f\n\n', scaling);
+dataTrimmedScaled = dataTrimmed./scaling;
+
+lambda = 4e-2;
+ADMM_iters = 25;
+T = [Regularizer("TVT")];
+NInnterIters = 3;
+tic;
+res = ADMM(A,dataTrimmedScaled,T,lambda,ADMM_iters,NInnterIters,[imsize NFrames],true);
+admmTime = toc;
+res = abs(res.*scaling);
+res_filtered = medfilt1(res,5,[],4);
+%cg_filtered = medfilt1(abs(cgres),3,[],4);
+
+% Set scale for ADMM recon
+scales = [];
+
+for i = 1:size(res,3)
+    ttt = res(:,:,i,:);
+    sortedData = sort(ttt(:),'ascend');
+    p999 = sortedData(round(.998 * length(sortedData)));
+    scales(i) =p999;
+end
+clear('ttt');
+
+
+save("MB_Speech","res","scales")       
+
+% Create Movie
+frameRate = 1./(NSpokes * 2.5e-3);
+v = VideoWriter("MB_Speech", 'MPEG-4');
+v.FrameRate =   frameRate;
+v.Quality = 100;
+open(v);
+f = figure(80);
+for i = 1:size(res,4)
+    subplot(1,3,1); imagesc(res_filtered(:,:,1,i),[0 scales(1)]); colormap(gray);axis off; axis image; drawnow;
+    subplot(1,3,2); imagesc(res_filtered(:,:,2,i),[0 scales(2)]); colormap(gray);axis off; axis image; drawnow;
+    subplot(1,3,3); imagesc(res_filtered(:,:,3,i),[0 scales(3)]); colormap(gray);axis off; axis image; drawnow;
+    frame = getframe(gcf);
+    writeVideo(v,frame);
+end
+close(v);
+

@@ -1,0 +1,26 @@
+% This function generarates a noise covariance matrix, psi, from a
+% twix noise structure passed in as argument
+
+function [psi] = GenNoiseCovariance(noiseTwix,showplot)
+    if nargin < 2
+        showplot = 0;
+    end
+    % Get some parameters out
+    NCol = noiseTwix.noise.NCol;
+    NCha = noiseTwix.noise.NCha;
+    NLin = noiseTwix.noise.NLin;
+    NAve = noiseTwix.noise.NAve;
+    
+    data = noiseTwix.noise.unsorted();
+    data = permute(data, [1 3 2]);
+    data = reshape(data, [NCol * NAve * NLin, NCha]);
+    data = permute(data,[2 1]);
+    psi  = (data*data') *(1/(NCol * NLin * NAve));
+    
+    if (showplot >0)
+        figure;
+        imagesc(abs(psi)); title("Noise Covariance");
+    end
+    psi = inv(chol(psi,'lower'));
+    
+end
